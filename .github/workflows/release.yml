@@ -1,0 +1,251 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "rhytmix-app: тег vX.Y.Z (релиз) или nightly"
+        required: true
+        default: nightly
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: salenyo/rhytmix-app
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+      release_id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - name: Pick channel, version and notes
+        id: meta
+        env:
+          REF: ${{ inputs.ref }}
+          RUN: ${{ github.run_number }}
+        run: |
+          set -e
+          case "$REF" in
+            nightly) CHANNEL=nightly ;;
+            v[0-9]*) CHANNEL=release ;;
+            *) echo "ref must be a vX.Y.Z tag or nightly, not '$REF'" >&2; exit 1 ;;
+          esac
+          SHA=$(git rev-parse HEAD)
+          VERSION=$(node scripts/ci-version.mjs "$CHANNEL" "$RUN")
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          cp src/changelog.js "$RUNNER_TEMP/changelog.mjs"
+          CHANNEL="$CHANNEL" VERSION="$VERSION" SHA="$SHA" node --input-type=module -e '
+            const { changelogFor } = await import(process.env.RUNNER_TEMP + "/changelog.mjs");
+            const v = process.env.VERSION;
+            const lines = [];
+            if (process.env.CHANNEL === "nightly") {
+              lines.push(
+                "Ночная сборка из ветки `nightly`, коммит `" + process.env.SHA.slice(0, 7) + "`.",
+                "Может быть нестабильной. Автообновление её не ставит, только вручную.",
+                "",
+              );
+            } else {
+              const notes = changelogFor(v, "ru") || [];
+              if (notes.length) {
+                lines.push("## Что нового", "");
+                for (const n of notes) lines.push("- " + n);
+                lines.push("");
+              }
+            }
+            lines.push(
+              "## Скачать",
+              "",
+              "| Система | Файл |",
+              "|---|---|",
+              "| Windows | `Rhytmix_" + v + "_x64-setup.exe` |",
+              "| macOS (Apple Silicon и Intel) | `Rhytmix_" + v + "_universal.dmg` |",
+              "| Linux | `.AppImage`, `.deb` или `.rpm` |",
+              "| Arch Linux | `rhytmix-app_" + v + "_x86_64-linux.tar.gz` |",
+              "",
+              "Уже установленное приложение обновится само при следующем запуске.",
+            );
+            process.stdout.write(lines.join("\n") + "\n");
+          ' > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the draft
+        id: draft
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: Rhytmix v${{ steps.meta.outputs.version }}
+          body_path: ${{ runner.temp }}/notes.md
+          target_commitish: main
+          draft: true
+          prerelease: ${{ steps.meta.outputs.channel == 'nightly' }}
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            args: ""
+            rust_targets: ""
+          - platform: windows-latest
+            args: ""
+            rust_targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_KEY }}
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Stamp the version
+        shell: bash
+        run: node scripts/ci-version.mjs "${{ needs.prepare.outputs.channel }}" "${{ github.run_number }}"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          args: ${{ matrix.args }}
+
+      - name: Package Linux tarball (Arch and other distros)
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -e
+          STAGE="rhytmix-app_${VERSION}_x86_64-linux"
+          mkdir -p "$STAGE"
+          BIN=target/release/rhytmix-app
+          [ -f "$BIN" ] || BIN=src-tauri/target/release/rhytmix-app
+          cp "$BIN" "$STAGE/"
+          cp src-tauri/icons/128x128@2x.png "$STAGE/rhytmix-app.png"
+          cat > "$STAGE/rhytmix-app.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Rhytmix
+          Comment=Music from every source in one player
+          Exec=rhytmix-app
+          Icon=rhytmix-app
+          Categories=AudioVideo;Audio;Player;
+          Terminal=false
+          EOF
+          cat > "$STAGE/install.sh" <<'EOF'
+          #!/usr/bin/env sh
+          set -e
+          PREFIX="${PREFIX:-/usr/local}"
+          install -Dm755 rhytmix-app "$PREFIX/bin/rhytmix-app"
+          install -Dm644 rhytmix-app.desktop "$PREFIX/share/applications/rhytmix-app.desktop"
+          install -Dm644 rhytmix-app.png "$PREFIX/share/icons/hicolor/256x256/apps/rhytmix-app.png"
+          echo "Rhytmix installed to $PREFIX"
+          EOF
+          cat > "$STAGE/README.txt" <<'EOF'
+          Rhytmix for Arch Linux and other distributions.
+
+          Run directly:        ./rhytmix-app
+          Install system-wide: sudo ./install.sh
+
+          Dependencies (Arch): pacman -S webkit2gtk-4.1 alsa-lib
+          Note: builds installed from this archive do not auto-update.
+          Grab a newer archive from the releases page when one appears.
+          EOF
+          chmod +x "$STAGE/install.sh"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+
+      - name: Attach the Linux tarball to the draft
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: v${{ needs.prepare.outputs.version }}
+          draft: true
+          prerelease: ${{ needs.prepare.outputs.channel == 'nightly' }}
+          files: rhytmix-app_${{ needs.prepare.outputs.version }}_x86_64-linux.tar.gz
+          overwrite_files: true
+          fail_on_unmatched_files: true
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+    steps:
+      - name: Check that latest.json names every platform
+        run: |
+          set -e
+          ASSET=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
+            --jq '.[] | select(.name == "latest.json") | .id')
+          if [ -z "$ASSET" ]; then
+            echo "the draft has no latest.json" >&2
+            exit 1
+          fi
+          gh api -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET" > "$RUNNER_TEMP/latest.json"
+          for key in windows-x86_64 darwin-aarch64 darwin-x86_64 linux-x86_64; do
+            if ! jq -e --arg k "$key" '.platforms[$k].url and .platforms[$k].signature' "$RUNNER_TEMP/latest.json" >/dev/null; then
+              echo "latest.json has no usable entry for $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Publish the release
+        if: needs.prepare.outputs.channel == 'release'
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -F prerelease=false -f make_latest=true >/dev/null
+
+      - name: Publish the nightly
+        if: needs.prepare.outputs.channel == 'nightly'
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -F prerelease=true -f make_latest=false >/dev/null
